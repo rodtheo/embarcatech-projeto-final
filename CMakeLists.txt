@@ -35,7 +35,7 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(picotune picotune.c )
+add_executable(picotune picotune.c inc/ssd1306_i2c.c)
 
 pico_set_program_name(picotune "picotune")
 pico_set_program_version(picotune "0.1")
@@ -54,7 +54,7 @@ target_include_directories(picotune PRIVATE
 )
 
 # Add any user requested libraries
-target_link_libraries(picotune pico_stdlib hardware_adc hardware_dma hardware_pwm
+target_link_libraries(picotune pico_stdlib hardware_adc hardware_dma hardware_pwm hardware_i2c 
         
         )
 
