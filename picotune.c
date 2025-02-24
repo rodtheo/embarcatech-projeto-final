@@ -67,6 +67,29 @@ fix15 fi[NUM_SAMPLES];
 
 fix15 Sinewave[NUM_SAMPLES];
 fix15 window[NUM_SAMPLES];
+// 0.4 in fixed point (used for alpha max plus beta min)
+fix15 zero_point_4 = float2fix15(0.4) ;
+
+// Max and min macros
+#define max(a,b) ((a>b)?a:b)
+#define min(a,b) ((a<b)?a:b)
+
+//// Configuração da Máquina de Estado Finita (FSM) ////
+#define BUTTON_A 5
+#define LED_GREEN 11
+#define LED_RED 13
+
+// Estado para gerenciar os botões
+typedef enum {
+    IDLE,
+    DO,
+    RE,
+    MI,
+    FA,
+    SOL,
+    LA,
+    SI
+} State;
 
 void FFTfix(fix15 fr[], fix15 fi[]) {
 
@@ -152,6 +175,55 @@ void FFTfix(fix15 fr[], fix15 fi[]) {
         L = istep ;
     }
 }
+
+int calculate_fundamental_freq(){
+        static fix15 max_fr ;           // temporary variable for max freq calculation
+        static int max_fr_dex ;         // index of max frequency
+
+        // Aguarda o DMA terminar
+        dma_channel_wait_for_finish_blocking(sample_chan);
+        // Reseta os ponteiros do DMA
+        // dma_channel_set_read_addr(control_chan, &sample_address_pointer, false);
+        // Reinicia o DMA
+        // dma_channel_start(control_chan);
+
+        // Copy/window elements into a fixed-point array
+        for (int i=0; i<NUM_SAMPLES; i++) {
+            fr[i] = multfix15(int2fix15((int)sample_array[i]), window[i]) ;
+            fi[i] = (fix15) 0 ;
+        }
+
+        // Zero max frequency and max frequency index
+        max_fr = 0 ;
+        max_fr_dex = 0 ;
+
+        // Reinicia o canal de amostras, agora que temos nossa cópia das amostras
+        dma_channel_start(control_chan);
+
+        
+        // Compute the FFT
+        FFTfix(fr, fi) ;
+
+        // Find the magnitudes (alpha max plus beta min)
+        for (int i = 0; i < (NUM_SAMPLES>>1); i++) {  
+            // get the approx magnitude
+            fr[i] = abs(fr[i]); 
+            fi[i] = abs(fi[i]);
+            // reuse fr to hold magnitude
+            fr[i] = max(fr[i], fi[i]) + 
+                    multfix15(min(fr[i], fi[i]), zero_point_4); 
+
+            // Keep track of maximum
+            if (fr[i] > max_fr && i>4) {
+                max_fr = fr[i] ;
+                max_fr_dex = i ;
+            }
+        }
+        // Compute max frequency in Hz
+        float max_freqency = max_fr_dex * (Fs/NUM_SAMPLES) ;
+
+        return max_freqency;
+        }
 
 int main()
 {
@@ -267,6 +339,8 @@ int main()
     printf("Iniciando captura\n");
 
     char text_freq[50];
+    char text_nota[50];
+
     
     char *text[] = {
         "  Iniciando   ",
@@ -290,13 +364,6 @@ int main()
     static fix15 max_fr ;           // temporary variable for max freq calculation
     static int max_fr_dex ;         // index of max frequency
 
-    // Max and min macros
-    #define max(a,b) ((a>b)?a:b)
-    #define min(a,b) ((a<b)?a:b)
-
-    // 0.4 in fixed point (used for alpha max plus beta min)
-    fix15 zero_point_4 = float2fix15(0.4) ;
-
     // Populate the sine table and Hann window table
     int ii;
     for (ii = 0; ii < NUM_SAMPLES; ii++) {
@@ -304,71 +371,256 @@ int main()
         window[ii] = float2fix15(0.5 * (1.0 - cos(6.283 * ((float) ii) / ((float)NUM_SAMPLES))));
     }
 
+    ////
+    // ==== CONFIGURAÇÃO DA FSM ====
+    ////
+    static State s = IDLE;
+    int buttonState = gpio_get(BUTTON_A);
+    int edge;
+    int buttonNow;
+    gpio_set_function(BUTTON_A, GPIO_FUNC_SIO); // Set GPIO 5 Button A
+    gpio_set_dir(BUTTON_A, GPIO_IN); // Set GPIO 5 to input
+    gpio_pull_up(BUTTON_A);
+
+    gpio_set_function(LED_GREEN, GPIO_FUNC_SIO); // Set GPIO 12 to SIO
+    gpio_set_dir(LED_GREEN, GPIO_OUT); // Set GPIO 15 to output
+    gpio_pull_up(LED_GREEN); // Enable pull-up on GPIO 12
+    gpio_put(LED_GREEN, 0); // Set GPIO 12 to low
+
+    gpio_set_function(LED_RED, GPIO_FUNC_SIO); // Set GPIO 12 to SIO
+    gpio_set_dir(LED_RED, GPIO_OUT); // Set GPIO 15 to output
+    gpio_pull_up(LED_RED); // Enable pull-up on GPIO 12
+    gpio_put(LED_RED, 0); // Set GPIO 12 to low
+
+    int freq_desejada = 0;
+
     while (true) {
         
-        // Aguarda o DMA terminar
-        dma_channel_wait_for_finish_blocking(sample_chan);
-        // Reseta os ponteiros do DMA
-        // dma_channel_set_read_addr(control_chan, &sample_address_pointer, false);
-        // Reinicia o DMA
-        // dma_channel_start(control_chan);
+        // Configuração do botão A de controle da FSM
+        buttonNow = !gpio_get(BUTTON_A);
+        edge = buttonState - buttonNow;
+        buttonState = buttonNow;
 
-        // Copy/window elements into a fixed-point array
-        for (i=0; i<NUM_SAMPLES; i++) {
-            fr[i] = multfix15(int2fix15((int)sample_array[i]), window[i]) ;
-            fi[i] = (fix15) 0 ;
+        max_freqency = calculate_fundamental_freq();
+
+        switch (s)
+        {
+            case IDLE:
+                memset(ssd, 0, ssd1306_buffer_length);
+                render_on_display(ssd, &frame_area);
+                char *text[] = {
+                    "   Aperte o   ",
+                    " botao  A para",
+                    " selecionar a  ",
+                    "  nota musical "};
+
+                int y = 0;
+                for (uint i = 0; i < count_of(text); i++)
+                {
+                    ssd1306_draw_string(ssd, 5, y, text[i]);
+                    y += 8;
+                }
+                render_on_display(ssd, &frame_area);
+
+                if (edge == 1)
+                {
+                    s = DO;
+                }
+                break;
+            case DO:
+                memset(ssd, 0, ssd1306_buffer_length);
+                render_on_display(ssd, &frame_area);
+                freq_desejada = 263;
+                
+                strcpy(text_nota,"Afinando o DO");
+                y = 0;
+                ssd1306_draw_string(ssd, 5, y, text_nota);
+                
+                sprintf(text_freq, "Freq %d Hz",(int)max_freqency);
+                y = 16;
+                ssd1306_draw_string(ssd, 5, y, text_freq);
+                render_on_display(ssd, &frame_area);
+
+                if (max_freqency > freq_desejada - 5 && max_freqency < freq_desejada + 5)
+                {
+                    gpio_put(LED_GREEN, 1); 
+                } else {
+                    gpio_put(LED_GREEN, 0);
+                    gpio_put(LED_RED, 1); 
+                }
+
+                if (edge == 1)
+                {
+                    s = RE;
+                }
+                break;
+            case RE:
+                memset(ssd, 0, ssd1306_buffer_length);
+                render_on_display(ssd, &frame_area);
+                freq_desejada = 300;
+                
+                strcpy(text_nota, "Afinando o RE");
+                y = 0;
+                ssd1306_draw_string(ssd, 5, y, text_nota);
+                
+                sprintf(text_freq, "Freq %d Hz",(int)max_freqency);
+                y = 16;
+                ssd1306_draw_string(ssd, 5, y, text_freq);
+                render_on_display(ssd, &frame_area);
+
+                if (max_freqency > freq_desejada - 5 && max_freqency < freq_desejada + 5)
+                {
+                    gpio_put(LED_GREEN, 1); 
+                } else {
+                    gpio_put(LED_GREEN, 0);
+                    gpio_put(LED_RED, 1); 
+                }
+
+                if (edge == 1)
+                {
+                    s = MI;
+                }
+                break;
+            case MI:
+                memset(ssd, 0, ssd1306_buffer_length);
+                render_on_display(ssd, &frame_area);
+                freq_desejada = 330;
+                
+                strcpy(text_nota, "Afinando o MI");
+                y = 0;
+                ssd1306_draw_string(ssd, 5, y, text_nota);
+                
+                sprintf(text_freq, "Freq %d Hz",(int)max_freqency);
+                y = 16;
+                ssd1306_draw_string(ssd, 5, y, text_freq);
+                render_on_display(ssd, &frame_area);
+
+                if (max_freqency > freq_desejada - 5 && max_freqency < freq_desejada + 5)
+                {
+                    gpio_put(LED_GREEN, 1); 
+                } else {
+                    gpio_put(LED_GREEN, 0);
+                    gpio_put(LED_RED, 1); 
+                }
+
+                if (edge == 1)
+                {
+                    s = FA;
+                }
+                break;
+            case FA:
+                memset(ssd, 0, ssd1306_buffer_length);
+                render_on_display(ssd, &frame_area);
+                freq_desejada = 352;
+                
+                strcpy(text_nota, "Afinando o FA");
+                y = 0;
+                ssd1306_draw_string(ssd, 5, y, text_nota);
+                
+                sprintf(text_freq, "Freq %d Hz",(int)max_freqency);
+                y = 16;
+                ssd1306_draw_string(ssd, 5, y, text_freq);
+                render_on_display(ssd, &frame_area);
+
+                if (max_freqency > freq_desejada - 5 && max_freqency < freq_desejada + 5)
+                {
+                    gpio_put(LED_GREEN, 1); 
+                } else {
+                    gpio_put(LED_GREEN, 0);
+                    gpio_put(LED_RED, 1); 
+                }
+
+                if (edge == 1)
+                {
+                    s = SOL;
+                }
+                break;
+            case SOL:
+                memset(ssd, 0, ssd1306_buffer_length);
+                render_on_display(ssd, &frame_area);
+                freq_desejada = 396;
+                
+                strcpy(text_nota, "Afinando o SOL");
+                y = 0;
+                ssd1306_draw_string(ssd, 5, y, text_nota);
+                
+                sprintf(text_freq, "Freq %d Hz",(int)max_freqency);
+                y = 16;
+                ssd1306_draw_string(ssd, 5, y, text_freq);
+                render_on_display(ssd, &frame_area);
+
+                if (max_freqency > freq_desejada - 5 && max_freqency < freq_desejada + 5)
+                {
+                    gpio_put(LED_GREEN, 1); 
+                } else {
+                    gpio_put(LED_GREEN, 0);
+                    gpio_put(LED_RED, 1); 
+                }
+
+                if (edge == 1)
+                {
+                    s = LA;
+                }
+                break;
+            case LA:
+                memset(ssd, 0, ssd1306_buffer_length);
+                render_on_display(ssd, &frame_area);
+                freq_desejada = 440;
+                
+                strcpy(text_nota, "Afinando o LA");
+                y = 0;
+                ssd1306_draw_string(ssd, 5, y, text_nota);
+                
+                sprintf(text_freq, "Freq %d Hz",(int)max_freqency);
+                y = 16;
+                ssd1306_draw_string(ssd, 5, y, text_freq);
+                render_on_display(ssd, &frame_area);
+
+                if (max_freqency > freq_desejada - 5 && max_freqency < freq_desejada + 5)
+                {
+                    gpio_put(LED_GREEN, 1); 
+                } else {
+                    gpio_put(LED_GREEN, 0);
+                    gpio_put(LED_RED, 1); 
+                }
+
+                if (edge == 1)
+                {
+                    s = SI;
+                }
+                break;
+            case SI:
+                memset(ssd, 0, ssd1306_buffer_length);
+                render_on_display(ssd, &frame_area);
+                freq_desejada = 495;
+                
+                strcpy(text_nota, "Afinando o SI");
+                y = 0;
+                ssd1306_draw_string(ssd, 5, y, text_nota);
+                
+                sprintf(text_freq, "Freq %d Hz",(int)max_freqency);
+                y = 16;
+                ssd1306_draw_string(ssd, 5, y, text_freq);
+                render_on_display(ssd, &frame_area);
+
+                if (max_freqency > freq_desejada - 5 && max_freqency < freq_desejada + 5)
+                {
+                    gpio_put(LED_GREEN, 1); 
+                } else {
+                    gpio_put(LED_GREEN, 0);
+                    gpio_put(LED_RED, 1); 
+                }
+
+                if (edge == 1)
+                {
+                    s = IDLE;
+                }
+                break;
+            default:
+                s = IDLE;
         }
-
-        // Zero max frequency and max frequency index
-        max_fr = 0 ;
-        max_fr_dex = 0 ;
-
-        // Reinicia o canal de amostras, agora que temos nossa cópia das amostras
-        dma_channel_start(control_chan);
-
         
-        // Compute the FFT
-        FFTfix(fr, fi) ;
-
-        // Find the magnitudes (alpha max plus beta min)
-        for (int i = 0; i < (NUM_SAMPLES>>1); i++) {  
-            // get the approx magnitude
-            fr[i] = abs(fr[i]); 
-            fi[i] = abs(fi[i]);
-            // reuse fr to hold magnitude
-            fr[i] = max(fr[i], fi[i]) + 
-                    multfix15(min(fr[i], fi[i]), zero_point_4); 
-
-            // Keep track of maximum
-            if (fr[i] > max_fr && i>4) {
-                max_fr = fr[i] ;
-                max_fr_dex = i ;
-            }
-        }
-        // Compute max frequency in Hz
-        max_freqency = max_fr_dex * (Fs/NUM_SAMPLES) ;
-
-        printf("----\n");
-        // Imprime as primeiras 10 amostras
-        // for (int i = 0; i < NUM_SAMPLES; i++) {
-        // printf("%d\n", sample_array[i]);
-        // }
-
-        // free(text_freq);
-        memset(ssd, 0, ssd1306_buffer_length);
-        render_on_display(ssd, &frame_area);
-
-        float diff_to_mi = 330.0 - max_freqency;
-        sprintf(text_freq, "Freq: %d Hz",(int)max_freqency);
-        y = 0;
-        ssd1306_draw_string(ssd, 5, y, text_freq);
-        render_on_display(ssd, &frame_area);
-        
-        printf("%f\n", max_freqency);
-        printf("----\n");
-
-        // Dorme por 1 segundo
-        sleep_ms(250);
+        sleep_ms(100);
     
     }
 
